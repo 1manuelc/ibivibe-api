@@ -7,6 +7,7 @@ import {
 } from '@aws-sdk/client-s3';
 import {
 	ConflictException,
+	BadRequestException,
 	ForbiddenException,
 	Injectable,
 	NotFoundException,
@@ -16,6 +17,12 @@ import { PrismaService } from 'src/modules/common/prisma/prisma.service';
 
 @Injectable()
 export class MediasService {
+	private static readonly MAX_BUSINESS_GALLERY_ITEMS = 10;
+	private static readonly ALLOWED_IMAGE_TYPES = new Set([
+		'image/jpeg',
+		'image/png',
+		'image/webp',
+	]);
 	private readonly s3: S3Client;
 	private readonly bucket: string;
 	private readonly publicUrl: string;
@@ -36,8 +43,26 @@ export class MediasService {
 		this.publicUrl = config.getOrThrow('R2_PUBLIC_URL');
 	}
 
-	async upload(file: Express.Multer.File) {
-		const key = `uploads/${randomUUID()}-${file.originalname}`;
+	private assertImage(file: Express.Multer.File) {
+		if (!file) throw new BadRequestException('Image file is required');
+		if (!MediasService.ALLOWED_IMAGE_TYPES.has(file.mimetype))
+			throw new BadRequestException(
+				'Only JPEG, PNG, and WebP images are allowed',
+			);
+	}
+
+	private extensionFor(mimetype: string) {
+		return { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }[
+			mimetype
+		]!;
+	}
+
+	async upload(
+		file: Express.Multer.File,
+		folder: 'business-profile' | 'business-gallery',
+	) {
+		this.assertImage(file);
+		const key = `${folder}/${randomUUID()}.${this.extensionFor(file.mimetype)}`;
 
 		await this.s3.send(
 			new PutObjectCommand({
@@ -113,25 +138,26 @@ export class MediasService {
 		dto: any,
 	) {
 		await this.assertOwner(businessId, accountId);
-		if (!file) throw new ConflictException('Media file is required');
-		const uploaded = await this.upload(file);
+		this.assertImage(file);
+		const count = await this.prismaService.media.count({
+			where: { business_id: businessId },
+		});
+		if (count >= MediasService.MAX_BUSINESS_GALLERY_ITEMS)
+			throw new ConflictException(
+				'Business gallery limit of 10 images reached',
+			);
+		const uploaded = await this.upload(file, 'business-gallery');
 		try {
 			return await this.prismaService.$transaction(async (tx) => {
-				if (dto.is_cover)
-					await tx.media.updateMany({
-						where: { business_id: businessId },
-						data: { is_cover: false },
-					});
 				const position =
 					dto.position ??
 					(await tx.media.count({ where: { business_id: businessId } }));
 				return tx.media.create({
 					data: {
 						business_id: businessId,
-						media_type: dto.media_type || 'image',
+						media_type: 'image',
 						url: uploaded.url,
-						thumbnail_url: dto.thumbnail_url,
-						is_cover: dto.is_cover ?? false,
+						is_cover: false,
 						position,
 						alt_text: dto.alt_text,
 					},
@@ -141,6 +167,52 @@ export class MediasService {
 			await this.delete(uploaded.key).catch(() => undefined);
 			throw error;
 		}
+	}
+
+	async uploadBusinessProfilePhoto(
+		businessId: string,
+		accountId: string,
+		file: Express.Multer.File,
+	) {
+		await this.assertOwner(businessId, accountId);
+		const current = await this.prismaService.business.findUnique({
+			where: { id: businessId },
+			select: { profile_photo_url: true },
+		});
+		const uploaded = await this.upload(file, 'business-profile');
+		try {
+			const business = await this.prismaService.business.update({
+				where: { id: businessId },
+				data: { profile_photo_url: uploaded.url },
+				select: { profile_photo_url: true },
+			});
+			if (current?.profile_photo_url)
+				await this.delete(this.keyFromUrl(current.profile_photo_url)).catch(
+					() => undefined,
+				);
+			return { profile_photo_url: business.profile_photo_url };
+		} catch (error) {
+			await this.delete(uploaded.key).catch(() => undefined);
+			throw error;
+		}
+	}
+
+	async removeBusinessProfilePhoto(businessId: string, accountId: string) {
+		await this.assertOwner(businessId, accountId);
+		const business = await this.prismaService.business.findUnique({
+			where: { id: businessId },
+			select: { profile_photo_url: true },
+		});
+		if (!business?.profile_photo_url)
+			throw new NotFoundException('Profile photo not found');
+		await this.prismaService.business.update({
+			where: { id: businessId },
+			data: { profile_photo_url: null },
+		});
+		await this.delete(this.keyFromUrl(business.profile_photo_url)).catch(
+			() => undefined,
+		);
+		return { deleted: true };
 	}
 
 	async updateBusinessMedia(
@@ -155,18 +227,11 @@ export class MediasService {
 		});
 		if (!media) throw new NotFoundException('Media not found');
 		return this.prismaService.$transaction(async (tx) => {
-			if (dto.is_cover)
-				await tx.media.updateMany({
-					where: { business_id: businessId, id: { not: mediaId } },
-					data: { is_cover: false },
-				});
 			return tx.media.update({
 				where: { id: mediaId },
 				data: {
-					is_cover: dto.is_cover,
 					position: dto.position,
 					alt_text: dto.alt_text,
-					thumbnail_url: dto.thumbnail_url,
 				},
 			});
 		});

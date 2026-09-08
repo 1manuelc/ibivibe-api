@@ -74,6 +74,7 @@ model business {
   id                String                    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   owner_account_id  String                    @unique @db.Uuid
   commercial_name   String?                   @db.VarChar(150)
+  profile_photo_url String?
   description       String?
   cnpj              String?                   @db.VarChar(20)
   max_reach_level   reach_level               @default(local)

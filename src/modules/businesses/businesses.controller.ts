@@ -51,6 +51,19 @@ import {
 } from './dto/business-service.dto';
 import { UpdateBusinessTagsDto } from './dto/business-tags.dto';
 
+const imageUploadOptions = {
+	limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+	fileFilter: (
+		_req: unknown,
+		file: Express.Multer.File,
+		callback: (error: Error | null, acceptFile: boolean) => void,
+	) =>
+		callback(
+			null,
+			['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype),
+		),
+};
+
 @ApiTags('businesses')
 @ApiBearerAuth()
 @Controller({ path: 'businesses', version: '1' })
@@ -326,17 +339,13 @@ export class BusinessesController {
 			type: 'object',
 			properties: {
 				file: { type: 'string', format: 'binary' },
-				media_type: { type: 'string', enum: ['image', 'video'] },
-				is_cover: { type: 'boolean' },
-				position: { type: 'integer' },
 				alt_text: { type: 'string' },
-				thumbnail_url: { type: 'string' },
 			},
 			required: ['file'],
 		},
 	})
 	@Post(':id/media')
-	@UseInterceptors(FileInterceptor('file'))
+	@UseInterceptors(FileInterceptor('file', imageUploadOptions))
 	mediaUpload(
 		@Param('id') id: string,
 		@CurrentAccount('id') accountId: string,
@@ -344,6 +353,35 @@ export class BusinessesController {
 		@Body() dto: UploadMediaDto,
 	) {
 		return this.mediasService.addBusinessMedia(id, accountId, file, dto);
+	}
+
+	@ApiOperation({ summary: 'Enviar foto de perfil da empresa' })
+	@ApiParam({ name: 'id', description: 'UUID da empresa' })
+	@ApiConsumes('multipart/form-data')
+	@ApiBody({
+		schema: {
+			type: 'object',
+			properties: { file: { type: 'string', format: 'binary' } },
+			required: ['file'],
+		},
+	})
+	@Post(':id/profile-photo')
+	@UseInterceptors(FileInterceptor('file', imageUploadOptions))
+	profilePhotoUpload(
+		@Param('id') id: string,
+		@CurrentAccount('id') accountId: string,
+		@UploadedFile() file: Express.Multer.File,
+	) {
+		return this.mediasService.uploadBusinessProfilePhoto(id, accountId, file);
+	}
+
+	@ApiOperation({ summary: 'Remover foto de perfil da empresa' })
+	@Delete(':id/profile-photo')
+	profilePhotoDelete(
+		@Param('id') id: string,
+		@CurrentAccount('id') accountId: string,
+	) {
+		return this.mediasService.removeBusinessProfilePhoto(id, accountId);
 	}
 
 	@ApiOperation({ summary: 'Reordenar mídias da empresa' })
