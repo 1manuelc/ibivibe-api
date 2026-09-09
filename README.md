@@ -116,7 +116,7 @@ O projeto utiliza PostgreSQL com Prisma como ORM. Principais entidades:
 
 ### Mídia (`/api/v1/media`)
 
-- `POST /media/upload` - Upload de mídia (Cloudflare R2)
+- `POST /businesses/:id/profile-photo` - Envia a foto de perfil da empresa para o R2 (`media/businesses/profile-photos`)
 - `DELETE /media/:key` - Remover mídia
 
 ### Busca (`/api/v1/search`)
@@ -163,6 +163,18 @@ R2_SECRET_KEY="..."
 R2_BUCKET="ibivibe-media"
 R2_PUBLIC_URL="https://cdn.seudominio.com.br"
 ```
+
+### Processamento de imagens
+
+Os uploads de imagens passam pela API antes do R2. O servidor valida o conteúdo
+binário (não apenas o `Content-Type` informado), limita cada arquivo a 5 MB e
+rejeita dimensões maiores que 4096×4096 ou 16 megapixels. JPEG, PNG e WebP são
+normalizados para WebP, sem metadados e com rotação EXIF aplicada. Fotos de
+perfil são limitadas a 1024×1024 e imagens de galeria a 1920×1920.
+
+As credenciais do R2 são exclusivas do backend. As variáveis usadas são
+`R2_ENDPOINT`, `R2_ACCESS_KEY`, `R2_SECRET_KEY`, `R2_BUCKET` e
+`R2_PUBLIC_URL`.
 
 ### 4. Configurar banco de dados
 
