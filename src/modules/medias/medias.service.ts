@@ -1,72 +1,62 @@
 import { randomUUID } from 'crypto';
 
 import {
-	DeleteObjectCommand,
-	PutObjectCommand,
-	S3Client,
-} from '@aws-sdk/client-s3';
-import {
 	ConflictException,
+	BadRequestException,
 	ForbiddenException,
 	Injectable,
+	Logger,
 	NotFoundException,
 } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/modules/common/prisma/prisma.service';
+
+import {
+	ImageProcessingService,
+	type ImageUploadPurpose,
+} from './image-processing.service';
+import { R2StorageService } from './r2-storage.service';
 
 @Injectable()
 export class MediasService {
-	private readonly s3: S3Client;
-	private readonly bucket: string;
-	private readonly publicUrl: string;
+	private static readonly MAX_BUSINESS_GALLERY_ITEMS = 10;
+	private readonly logger = new Logger(MediasService.name);
 
 	constructor(
 		private readonly prismaService: PrismaService,
-		private readonly config: ConfigService,
-	) {
-		this.s3 = new S3Client({
-			region: 'auto',
-			endpoint: config.getOrThrow('R2_ENDPOINT'),
-			credentials: {
-				accessKeyId: config.getOrThrow('R2_ACCESS_KEY'),
-				secretAccessKey: config.getOrThrow('R2_SECRET_KEY'),
-			},
-		});
-		this.bucket = config.getOrThrow('R2_BUCKET');
-		this.publicUrl = config.getOrThrow('R2_PUBLIC_URL');
+		private readonly imageProcessingService: ImageProcessingService,
+		private readonly storageService: R2StorageService,
+	) {}
+
+	private assertImage(file: Express.Multer.File) {
+		if (!file) throw new BadRequestException('Image file is required');
 	}
 
-	async upload(file: Express.Multer.File) {
-		const key = `uploads/${randomUUID()}-${file.originalname}`;
-
-		await this.s3.send(
-			new PutObjectCommand({
-				Bucket: this.bucket,
-				Key: key,
-				Body: file.buffer,
-				ContentType: file.mimetype,
-			}),
-		);
-
-		return {
+	async upload(file: Express.Multer.File, purpose: ImageUploadPurpose) {
+		this.assertImage(file);
+		const startedAt = performance.now();
+		const processed = await this.imageProcessingService.process(file, purpose);
+		const folder =
+			purpose === 'business-profile'
+				? 'media/businesses/profile-photos'
+				: 'media/businesses/gallery';
+		const key = `${folder}/${randomUUID()}.${processed.extension}`;
+		const uploaded = await this.storageService.upload(
 			key,
-			url: `${this.publicUrl}/${key}`,
-		};
+			processed.buffer,
+			processed.contentType,
+		);
+		this.logger.log(
+			`Image uploaded (${purpose}): ${file.size}B → ${processed.buffer.length}B in ${Math.round(performance.now() - startedAt)}ms`,
+		);
+		return uploaded;
 	}
 
 	async delete(key: string) {
-		await this.s3.send(
-			new DeleteObjectCommand({
-				Bucket: this.bucket,
-				Key: key,
-			}),
-		);
-
-		return { deleted: true };
+		return this.storageService.delete(key);
 	}
 
 	getPublicUrl(key: string) {
-		return `${this.publicUrl}/${key}`;
+		return this.storageService.getPublicUrl(key);
 	}
 
 	async getMediaByCity(id: string): Promise<any[]> {
@@ -101,9 +91,7 @@ export class MediasService {
 	}
 
 	private keyFromUrl(url: string) {
-		return url.startsWith(this.publicUrl + '/')
-			? url.slice(this.publicUrl.length + 1)
-			: url;
+		return this.storageService.keyFromPublicUrl(url);
 	}
 
 	async addBusinessMedia(
@@ -113,25 +101,26 @@ export class MediasService {
 		dto: any,
 	) {
 		await this.assertOwner(businessId, accountId);
-		if (!file) throw new ConflictException('Media file is required');
-		const uploaded = await this.upload(file);
+		this.assertImage(file);
+		const count = await this.prismaService.media.count({
+			where: { business_id: businessId },
+		});
+		if (count >= MediasService.MAX_BUSINESS_GALLERY_ITEMS)
+			throw new ConflictException(
+				'Business gallery limit of 10 images reached',
+			);
+		const uploaded = await this.upload(file, 'business-gallery');
 		try {
 			return await this.prismaService.$transaction(async (tx) => {
-				if (dto.is_cover)
-					await tx.media.updateMany({
-						where: { business_id: businessId },
-						data: { is_cover: false },
-					});
 				const position =
 					dto.position ??
 					(await tx.media.count({ where: { business_id: businessId } }));
 				return tx.media.create({
 					data: {
 						business_id: businessId,
-						media_type: dto.media_type || 'image',
+						media_type: 'image',
 						url: uploaded.url,
-						thumbnail_url: dto.thumbnail_url,
-						is_cover: dto.is_cover ?? false,
+						is_cover: false,
 						position,
 						alt_text: dto.alt_text,
 					},
@@ -141,6 +130,51 @@ export class MediasService {
 			await this.delete(uploaded.key).catch(() => undefined);
 			throw error;
 		}
+	}
+
+	async uploadBusinessProfilePhoto(
+		businessId: string,
+		accountId: string,
+		file: Express.Multer.File,
+	) {
+		await this.assertOwner(businessId, accountId);
+		const current = await this.prismaService.business.findUnique({
+			where: { id: businessId },
+			select: { profile_photo_url: true },
+		});
+		const uploaded = await this.upload(file, 'business-profile');
+		try {
+			const business = await this.prismaService.business.update({
+				where: { id: businessId },
+				data: { profile_photo_url: uploaded.url },
+				select: { profile_photo_url: true },
+			});
+			const currentKey = current?.profile_photo_url
+				? this.keyFromUrl(current.profile_photo_url)
+				: null;
+			if (currentKey) await this.delete(currentKey).catch(() => undefined);
+			return { profile_photo_url: business.profile_photo_url };
+		} catch (error) {
+			await this.delete(uploaded.key).catch(() => undefined);
+			throw error;
+		}
+	}
+
+	async removeBusinessProfilePhoto(businessId: string, accountId: string) {
+		await this.assertOwner(businessId, accountId);
+		const business = await this.prismaService.business.findUnique({
+			where: { id: businessId },
+			select: { profile_photo_url: true },
+		});
+		if (!business?.profile_photo_url)
+			throw new NotFoundException('Profile photo not found');
+		await this.prismaService.business.update({
+			where: { id: businessId },
+			data: { profile_photo_url: null },
+		});
+		const key = this.keyFromUrl(business.profile_photo_url);
+		if (key) await this.delete(key).catch(() => undefined);
+		return { deleted: true };
 	}
 
 	async updateBusinessMedia(
@@ -155,18 +189,11 @@ export class MediasService {
 		});
 		if (!media) throw new NotFoundException('Media not found');
 		return this.prismaService.$transaction(async (tx) => {
-			if (dto.is_cover)
-				await tx.media.updateMany({
-					where: { business_id: businessId, id: { not: mediaId } },
-					data: { is_cover: false },
-				});
 			return tx.media.update({
 				where: { id: mediaId },
 				data: {
-					is_cover: dto.is_cover,
 					position: dto.position,
 					alt_text: dto.alt_text,
-					thumbnail_url: dto.thumbnail_url,
 				},
 			});
 		});
@@ -183,7 +210,8 @@ export class MediasService {
 		});
 		if (!media) throw new NotFoundException('Media not found');
 		await this.prismaService.media.delete({ where: { id: mediaId } });
-		await this.delete(this.keyFromUrl(media.url)).catch(() => undefined);
+		const key = this.keyFromUrl(media.url);
+		if (key) await this.delete(key).catch(() => undefined);
 		return { deleted: true };
 	}
 

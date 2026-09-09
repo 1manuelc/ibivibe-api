@@ -65,6 +65,7 @@ Table business {
   id String [pk]
   owner_account_id String [unique, not null]
   commercial_name String
+  profile_photo_url String
   description String
   cnpj String
   max_reach_level reach_level [not null, default: 'local']
