@@ -1,97 +1,62 @@
 import { randomUUID } from 'crypto';
 
 import {
-	DeleteObjectCommand,
-	PutObjectCommand,
-	S3Client,
-} from '@aws-sdk/client-s3';
-import {
 	ConflictException,
 	BadRequestException,
 	ForbiddenException,
 	Injectable,
+	Logger,
 	NotFoundException,
 } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/modules/common/prisma/prisma.service';
+
+import {
+	ImageProcessingService,
+	type ImageUploadPurpose,
+} from './image-processing.service';
+import { R2StorageService } from './r2-storage.service';
 
 @Injectable()
 export class MediasService {
 	private static readonly MAX_BUSINESS_GALLERY_ITEMS = 10;
-	private static readonly ALLOWED_IMAGE_TYPES = new Set([
-		'image/jpeg',
-		'image/png',
-		'image/webp',
-	]);
-	private readonly s3: S3Client;
-	private readonly bucket: string;
-	private readonly publicUrl: string;
+	private readonly logger = new Logger(MediasService.name);
 
 	constructor(
 		private readonly prismaService: PrismaService,
-		private readonly config: ConfigService,
-	) {
-		this.s3 = new S3Client({
-			region: 'auto',
-			endpoint: config.getOrThrow('R2_ENDPOINT'),
-			credentials: {
-				accessKeyId: config.getOrThrow('R2_ACCESS_KEY'),
-				secretAccessKey: config.getOrThrow('R2_SECRET_KEY'),
-			},
-		});
-		this.bucket = config.getOrThrow('R2_BUCKET');
-		this.publicUrl = config.getOrThrow('R2_PUBLIC_URL');
-	}
+		private readonly imageProcessingService: ImageProcessingService,
+		private readonly storageService: R2StorageService,
+	) {}
 
 	private assertImage(file: Express.Multer.File) {
 		if (!file) throw new BadRequestException('Image file is required');
-		if (!MediasService.ALLOWED_IMAGE_TYPES.has(file.mimetype))
-			throw new BadRequestException(
-				'Only JPEG, PNG, and WebP images are allowed',
-			);
 	}
 
-	private extensionFor(mimetype: string) {
-		return { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }[
-			mimetype
-		]!;
-	}
-
-	async upload(
-		file: Express.Multer.File,
-		folder: 'business-profile' | 'business-gallery',
-	) {
+	async upload(file: Express.Multer.File, purpose: ImageUploadPurpose) {
 		this.assertImage(file);
-		const key = `${folder}/${randomUUID()}.${this.extensionFor(file.mimetype)}`;
-
-		await this.s3.send(
-			new PutObjectCommand({
-				Bucket: this.bucket,
-				Key: key,
-				Body: file.buffer,
-				ContentType: file.mimetype,
-			}),
-		);
-
-		return {
+		const startedAt = performance.now();
+		const processed = await this.imageProcessingService.process(file, purpose);
+		const folder =
+			purpose === 'business-profile'
+				? 'media/businesses/profile-photos'
+				: 'media/businesses/gallery';
+		const key = `${folder}/${randomUUID()}.${processed.extension}`;
+		const uploaded = await this.storageService.upload(
 			key,
-			url: `${this.publicUrl}/${key}`,
-		};
+			processed.buffer,
+			processed.contentType,
+		);
+		this.logger.log(
+			`Image uploaded (${purpose}): ${file.size}B → ${processed.buffer.length}B in ${Math.round(performance.now() - startedAt)}ms`,
+		);
+		return uploaded;
 	}
 
 	async delete(key: string) {
-		await this.s3.send(
-			new DeleteObjectCommand({
-				Bucket: this.bucket,
-				Key: key,
-			}),
-		);
-
-		return { deleted: true };
+		return this.storageService.delete(key);
 	}
 
 	getPublicUrl(key: string) {
-		return `${this.publicUrl}/${key}`;
+		return this.storageService.getPublicUrl(key);
 	}
 
 	async getMediaByCity(id: string): Promise<any[]> {
@@ -126,9 +91,7 @@ export class MediasService {
 	}
 
 	private keyFromUrl(url: string) {
-		return url.startsWith(this.publicUrl + '/')
-			? url.slice(this.publicUrl.length + 1)
-			: url;
+		return this.storageService.keyFromPublicUrl(url);
 	}
 
 	async addBusinessMedia(
@@ -186,10 +149,10 @@ export class MediasService {
 				data: { profile_photo_url: uploaded.url },
 				select: { profile_photo_url: true },
 			});
-			if (current?.profile_photo_url)
-				await this.delete(this.keyFromUrl(current.profile_photo_url)).catch(
-					() => undefined,
-				);
+			const currentKey = current?.profile_photo_url
+				? this.keyFromUrl(current.profile_photo_url)
+				: null;
+			if (currentKey) await this.delete(currentKey).catch(() => undefined);
 			return { profile_photo_url: business.profile_photo_url };
 		} catch (error) {
 			await this.delete(uploaded.key).catch(() => undefined);
@@ -209,9 +172,8 @@ export class MediasService {
 			where: { id: businessId },
 			data: { profile_photo_url: null },
 		});
-		await this.delete(this.keyFromUrl(business.profile_photo_url)).catch(
-			() => undefined,
-		);
+		const key = this.keyFromUrl(business.profile_photo_url);
+		if (key) await this.delete(key).catch(() => undefined);
 		return { deleted: true };
 	}
 
@@ -248,7 +210,8 @@ export class MediasService {
 		});
 		if (!media) throw new NotFoundException('Media not found');
 		await this.prismaService.media.delete({ where: { id: mediaId } });
-		await this.delete(this.keyFromUrl(media.url)).catch(() => undefined);
+		const key = this.keyFromUrl(media.url);
+		if (key) await this.delete(key).catch(() => undefined);
 		return { deleted: true };
 	}
 
